@@ -2,21 +2,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from main import build_metric_value_path, scaling_is_needed
-
-
-@pytest.mark.parametrize(
-    "current_replicas, needed_replicas, return_value",
-    [
-        (0, 1, True),
-        (50, 0, True),
-        (0, 0, False),
-        (1, 1, False),
-        (5, 1, False),
-    ],
-)
-def test_scaling_is_needed(current_replicas, needed_replicas, return_value):
-    assert scaling_is_needed(current_replicas=current_replicas, needed_replicas=needed_replicas) == return_value
+from main import build_metric_value_path, scaling_down_is_needed, scaling_up_is_needed
 
 
 @dataclass(kw_only=True)
@@ -28,6 +14,34 @@ class _Metadata:
 @dataclass(kw_only=True)
 class _HorizontalPodAutoscaler:
     metadata: _Metadata
+
+
+@pytest.mark.parametrize(
+    "current_replicas, needed_replicas, return_value",
+    [
+        (0, 1, True),
+        (50, 0, False),
+        (0, 0, False),
+        (1, 1, False),
+        (5, 1, False),
+    ],
+)
+def test_scaling_up_is_needed(current_replicas, needed_replicas, return_value):
+    assert scaling_up_is_needed(current_replicas, needed_replicas) == return_value
+
+
+@pytest.mark.parametrize(
+    "current_replicas, needed_replicas, return_value",
+    [
+        (0, 1, False),
+        (50, 0, True),
+        (0, 0, False),
+        (1, 1, False),
+        (5, 1, False),
+    ],
+)
+def test_scaling_down_is_needed(current_replicas, needed_replicas, return_value):
+    assert scaling_down_is_needed(current_replicas, needed_replicas) == return_value
 
 
 @pytest.mark.parametrize(

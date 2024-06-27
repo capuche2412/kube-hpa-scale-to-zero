@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
-from time import sleep
+from time import sleep, time
 
 import kubernetes
 from kubernetes import watch
@@ -37,9 +37,16 @@ class HPA:
     metric_value_path: str
     target_kind: str
     target_name: str
+    scale_up_stabilization_window: int
+    scale_down_stabilization_window: int
 
 
-SYNC_INTERVAL = 30
+class MetricNotFound(Exception):
+    pass
+
+
+SYNC_INTERVAL = 10
+STABILIZATION_CHECK_INTERVAL = 1
 HPAs: dict[str, HPA] = {}
 
 
@@ -64,6 +71,8 @@ def watch_metrics() -> None:
 
 def watch_hpa(args) -> None:
     LOGGER.info(f"Will watch HPA with {args.hpa_label_selector=} in {args.hpa_namespace=}.")
+    LOGGER.info(f"The scale_up_stabilization_window is set to {args.scale_up_stabilization_window}s.")
+    LOGGER.info(f"The scale_down_stabilization_window is set to {args.scale_down_stabilization_window}s.")
     while True:
         try:
             w = watch.Watch()
@@ -72,13 +81,17 @@ def watch_hpa(args) -> None:
                 args.hpa_namespace,
                 label_selector=args.hpa_label_selector,
             ):
-                update_hpa(event["object"].metadata)
+                update_hpa(
+                    event["object"].metadata,
+                    scale_up_stabilization_window=args.scale_up_stabilization_window,
+                    scale_down_stabilization_window=args.scale_down_stabilization_window,
+                )
         except kubernetes.client.exceptions.ApiException as exc:
             if exc.status != 410:
                 raise exc
 
 
-def update_hpa(metadata) -> None:
+def update_hpa(metadata, scale_up_stabilization_window, scale_down_stabilization_window) -> None:
     """
     inserts/updates/deletes the HPA to/in/from HPAs.
     """
@@ -92,6 +105,8 @@ def update_hpa(metadata) -> None:
             metric_value_path=build_metric_value_path(hpa),
             target_kind=hpa.spec.scale_target_ref.kind,
             target_name=hpa.spec.scale_target_ref.name,
+            scale_up_stabilization_window=scale_up_stabilization_window,
+            scale_down_stabilization_window=scale_down_stabilization_window,
         )
     except kubernetes.client.exceptions.ApiException as exc:
         if exc.status != 404:
@@ -124,7 +139,7 @@ def build_metric_value_path(hpa) -> str:
 def get_needed_replicas(metric_value_path) -> int | None:
     """
     returns 0 if the metric value is 0, and 1 otherwise (HPA will take care of scaling up if needed)
-    returns None, if the needed replicas cannot be determined.
+    raise MetricNotFound, if the needed replicas cannot be determined.
     """
     try:
         # We suppose the MetricValueList does contain one item
@@ -133,75 +148,101 @@ def get_needed_replicas(metric_value_path) -> int | None:
         match exc.status:
             case 404 | 503 | 403:
                 LOGGER.exception(f"Could not get Custom metric at {metric_value_path}: {exc}")
+                raise MetricNotFound()
             case _:
                 raise exc
 
 
-def update_target(hpa: HPA) -> None:
+def get_replicas(*, hpa, read_scale) -> (int, int):
+    try:
+        scale = read_scale(namespace=hpa.namespace, name=hpa.name)
+    except kubernetes.client.exceptions.ApiException as exc:
+        if exc.status != 404:
+            raise exc
+        LOGGER.warning(f"{hpa.namespace}/{hpa.name} was not found.")
+
+    current_replicas = scale.status.replicas
     needed_replicas = get_needed_replicas(hpa.metric_value_path)
-    if needed_replicas is None:
-        LOGGER.error(f"Will not update {hpa.target_kind} {hpa.namespace}/{hpa.target_name}.")
-        return
-    # Maybe, be more precise (using target_api_version e.g.?)
+
+    return current_replicas, needed_replicas
+
+
+def update_target(hpa: HPA) -> None:
+
     match hpa.target_kind:
         case "Deployment":
-            scale_deployment(
-                namespace=hpa.namespace,
-                name=hpa.target_name,
-                needed_replicas=needed_replicas,
-            )
+            read_scale = APP_V1.read_namespaced_deployment_scale
+            patch_scale = APP_V1.patch_namespaced_deployment_scale
         case "StatefulSet":
-            scale_statefulset(
-                namespace=hpa.namespace,
-                name=hpa.target_name,
-                needed_replicas=needed_replicas,
-            )
+            read_scale = APP_V1.read_namespaced_stateful_set_scale
+            patch_scale = APP_V1.patch_namespaced_stateful_set_scale
         case _:
             raise ValueError(f"Target kind {hpa.target_kind} not supported.")
 
-
-def scaling_is_needed(*, current_replicas, needed_replicas) -> bool:
-    """
-    checks if the scale up/down is relevant.
-    """
-    # Maybe do not scale down if the HPA is unable to retrieve metrics? leave the current only pod do some work
-    return bool(current_replicas) != bool(needed_replicas)
-
-
-def scale_deployment(*, namespace, name, needed_replicas) -> None:
     try:
-        scale = APP_V1.read_namespaced_deployment_scale(namespace=namespace, name=name)
-        current_replicas = scale.status.replicas
-        if not scaling_is_needed(current_replicas=current_replicas, needed_replicas=needed_replicas):
-            LOGGER.info(f"No need to scale Deployment {namespace}/{name} {current_replicas=} {needed_replicas=}.")
-            return
-
-        scale.spec.replicas = needed_replicas
-        # Maybe do not scale immediately? but don't want to reimplement an HPA.
-        APP_V1.patch_namespaced_deployment_scale(namespace=namespace, name=name, body=scale)
-        LOGGER.info(f"Deployment {namespace}/{name} was scaled {current_replicas=}->{needed_replicas=}.")
+        if scaling_is_needed(hpa=hpa, read_scale=read_scale):
+            scale = read_scale(namespace=hpa.namespace, name=hpa.name)
+            current_replicas, needed_replicas = get_replicas(hpa=hpa, read_scale=read_scale)
+            scale.spec.replicas = needed_replicas
+            patch_scale(namespace=hpa.namespace, name=hpa.name, body=scale)
+            LOGGER.info(
+                f"{hpa.target_kind} {hpa.namespace}/{hpa.name} was scaled {current_replicas=}->{needed_replicas=}."
+            )
+        else:
+            current_replicas, needed_replicas = get_replicas(hpa=hpa, read_scale=read_scale)
+            LOGGER.info(
+                f"No need to scale {hpa.target_kind} {hpa.namespace}/{hpa.name} {current_replicas=} {needed_replicas=}."
+            )
     except kubernetes.client.exceptions.ApiException as exc:
         if exc.status != 404:
             raise exc
-        LOGGER.warning(f"Deployment {namespace}/{name} was not found.")
+        LOGGER.warning(f"{hpa.target_kind} {hpa.namespace}/{hpa.name} was not found.")
+    except MetricNotFound:
+        LOGGER.error(f"Will not update {hpa.target_kind} {hpa.namespace}/{hpa.target_name}.")
 
 
-def scale_statefulset(*, namespace, name, needed_replicas) -> None:
-    try:
-        scale = APP_V1.read_namespaced_stateful_set_scale(namespace=namespace, name=name)
-        current_replicas = scale.status.replicas
-        if not scaling_is_needed(current_replicas=current_replicas, needed_replicas=needed_replicas):
-            LOGGER.info(f"No need to scale statefulset {namespace}/{name} {current_replicas=} {needed_replicas=}.")
-            return
+def scaling_up_is_needed(current_replicas, needed_replicas):
+    return current_replicas < needed_replicas and needed_replicas == 1
 
-        scale.spec.replicas = needed_replicas
-        # Maybe do not scale immediately? but don't want to reimplement an HPA.
-        APP_V1.patch_namespaced_stateful_set_scale(namespace=namespace, name=name, body=scale)
-        LOGGER.info(f"StatefulSet {namespace}/{name} was scaled {current_replicas=}->{needed_replicas=}.")
-    except kubernetes.client.exceptions.ApiException as exc:
-        if exc.status != 404:
-            raise exc
-        LOGGER.warning(f"StatefulSet {namespace}/{name} was not found.")
+
+def scaling_down_is_needed(current_replicas, needed_replicas):
+    return current_replicas > needed_replicas and needed_replicas == 0
+
+
+def scaling_is_needed(*, hpa, read_scale) -> bool:
+    """
+    check if the metrics is scale up/down is relevant for the stabilization window duration
+    """
+
+    current_replicas, needed_replicas = get_replicas(hpa=hpa, read_scale=read_scale)
+
+    if scaling_up_is_needed(current_replicas, needed_replicas):
+        stabilization_window = hpa.scale_up_stabilization_window
+    elif scaling_down_is_needed(current_replicas, needed_replicas):
+        stabilization_window = hpa.scale_down_stabilization_window
+    else:
+        return False
+
+    if stabilization_window != 0:
+
+        stabilization_end_time = time() + stabilization_window
+
+        LOGGER.info(
+            f"{hpa.target_kind} {hpa.namespace}/{hpa.name} will be scaled ({current_replicas=}->{needed_replicas=}). "
+            "Waiting for stabilization..."
+        )
+
+        while time() < stabilization_end_time:
+
+            current_replicas, needed_replicas = get_replicas(hpa=hpa, read_scale=read_scale)
+
+            if bool(current_replicas) == bool(needed_replicas):
+                LOGGER.info(f"{hpa.target_kind} {hpa.namespace}/{hpa.name} scale is canceled due to stabilization.")
+                return False
+
+            sleep(STABILIZATION_CHECK_INTERVAL)
+
+    return True
 
 
 def parse_cli_args():
@@ -219,6 +260,22 @@ def parse_cli_args():
         dest="hpa_label_selector",
         default="",
         help="label_selector to get HPA to watch, 'foo=bar,bar=foo' e.g. (default: empty string to select all)",
+    )
+    # TODO: Remove when spec.behavior.scaleUp.stabilizationWindowSeconds can be retreived with the K8s Python API
+    parser.add_argument(
+        "--scale-up-stabilization-window",
+        dest="scale_up_stabilization_window",
+        default="0",
+        help="scale_up_stabilization_window restricts the flapping of replica count while scaling up (default: 0)",
+        type=int,
+    )
+    # TODO: Remove when spec.behavior.scaleDown.stabilizationWindowSeconds can be retreived with the K8s Python API
+    parser.add_argument(
+        "--scale-down-stabilization-window",
+        dest="scale_down_stabilization_window",
+        default="0",
+        help="scale_down_stabilization_window restricts the flapping of replica count while scaling up (default: 0)",
+        type=int,
     )
 
     return parser.parse_args()
